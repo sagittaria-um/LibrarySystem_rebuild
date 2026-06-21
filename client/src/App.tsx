@@ -177,11 +177,11 @@ async function request<T>(path: string, session: Session | null, options: Reques
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
-    data = { message: text.slice(0, 180) };
+    data = { message: normalizeErrorMessage(text.slice(0, 180)) };
   }
 
   if (!response.ok) {
-    const message = getMessage(data) ?? response.statusText ?? '请求失败';
+    const message = normalizeErrorMessage(getMessage(data) ?? response.statusText ?? '请求失败');
     notify(message, 'error');
     throw new Error(message);
   }
@@ -195,6 +195,25 @@ function getMessage(data: unknown) {
   }
 
   return '';
+}
+
+function normalizeErrorMessage(value: string) {
+  const text = value.trim();
+  if (!text) return text;
+
+  const stackMarker = ' at Microsoft.';
+  const stackIndex = text.indexOf(stackMarker);
+  const withoutStack = stackIndex >= 0 ? text.slice(0, stackIndex).trim() : text;
+
+  const triggerMarker = 'The transaction ended in the trigger.';
+  const triggerIndex = withoutStack.indexOf(triggerMarker);
+  const withoutTrigger = triggerIndex >= 0 ? withoutStack.slice(0, triggerIndex).trim() : withoutStack;
+
+  return withoutTrigger
+    .replace(/^Microsoft\.[^:]+:\s*/i, '')
+    .replace(/\s*\(0x[0-9A-F]+\):\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function notify(message: string, type: 'success' | 'error' = 'success') {
