@@ -57,8 +57,12 @@ if (app.Environment.IsDevelopment())
     app.UseCors("DevClient");
 }
 
-app.UseDefaultFiles();
-app.UseStaticFiles();
+var webRootPath = Path.Combine(app.Environment.ContentRootPath, "wwwroot");
+if (Directory.Exists(webRootPath))
+{
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+}
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -191,6 +195,7 @@ books.MapDelete("/{isbn}", async (string isbn, SqlConnectionFactory db) =>
 
 var readers = api.MapGroup("/readers").RequireAuthorization();
 
+// 1. 获取读者列表
 readers.MapGet("", async (string? q, SqlConnectionFactory db) =>
 {
     await using var connection = db.Create();
@@ -213,6 +218,119 @@ readers.MapGet("", async (string? q, SqlConnectionFactory db) =>
     return Results.Ok(rows);
 }).RequireAuthorization("AdminOnly");
 
+// 2. 新增读者 + 自动开户逻辑
+readers.MapPost("/legacy", async (UpsertReaderRequest dto, SqlConnectionFactory db) =>
+{
+    await using var connection = db.Create();
+    await connection.OpenAsync();
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    try
+    {
+        var exists = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(1) FROM dbo.Readers WHERE ReaderCardNo = @ReaderCardNo",
+            new { dto.ReaderCardNo },
+            transaction);
+
+        if (exists > 0)
+        {
+            return Results.Conflict(new { message = "该借书证号已存在。" });
+        }
+
+        await connection.ExecuteAsync(
+            """
+            INSERT INTO dbo.Readers (ReaderCardNo, Name, Gender, Title, MaxBorrowCount, BorrowedCount, Department, Phone)
+            VALUES (@ReaderCardNo, @Name, @Gender, @Title, @MaxBorrowCount, 0, @Department, @Phone)
+            """,
+            dto,
+            transaction);
+
+        string username = dto.ReaderCardNo;
+        if (dto.ReaderCardNo.Contains("-"))
+        {
+            var parts = dto.ReaderCardNo.Split('-');
+            username = parts[^1];
+        }
+
+        var accountExists = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(1) FROM dbo.Accounts WHERE Username = @username",
+            new { username },
+            transaction);
+
+        if (accountExists > 0)
+        {
+            return Results.Conflict(new { message = $"自动生成的账号名 [{username}] 已被系统占用。" });
+        }
+
+        string finalPassword = string.IsNullOrWhiteSpace(dto.Password) ? username : dto.Password.Trim();
+
+        await connection.ExecuteAsync(
+            """
+            INSERT INTO dbo.Accounts (Username, Password, Role, IsEnabled, ReaderCardNo)
+            VALUES (@Username, @Password, 'Reader', 1, @ReaderCardNo)
+            """,
+            new { Username = username, Password = finalPassword, ReaderCardNo = dto.ReaderCardNo },
+            transaction);
+
+        await transaction.CommitAsync();
+        return Results.StatusCode(201);
+    }
+    catch (Exception ex)
+    {
+        await transaction.RollbackAsync();
+        return Results.BadRequest(new { message = "创建读者及开户失败，数据已回滚。", detail = ex.Message });
+    }
+}).RequireAuthorization("AdminOnly");
+
+// 3. 修改读者信息逻辑
+readers.MapPut("/legacy/{readerCardNo}", async (string readerCardNo, UpsertReaderRequest dto, SqlConnectionFactory db) =>
+{
+    await using var connection = db.Create();
+    var affected = await connection.ExecuteAsync(
+        """
+        UPDATE dbo.Readers 
+        SET Name = @Name, Gender = @Gender, Title = @Title, 
+            MaxBorrowCount = @MaxBorrowCount, Department = @Department, Phone = @Phone
+        WHERE ReaderCardNo = @ReaderCardNo
+        """,
+        new { dto.Name, dto.Gender, dto.Title, dto.MaxBorrowCount, dto.Department, dto.Phone, ReaderCardNo = readerCardNo });
+
+    return affected == 0 ? Results.NotFound() : Results.NoContent();
+}).RequireAuthorization("AdminOnly");
+
+// 4. 删除读者逻辑（联动删除账号）
+readers.MapDelete("/legacy/{readerCardNo}", async (string readerCardNo, SqlConnectionFactory db) =>
+{
+    await using var connection = db.Create();
+    await connection.OpenAsync();
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    try
+    {
+        var hasLoans = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(1) FROM dbo.BorrowRecords WHERE ReaderCardNo = @readerCardNo AND ReturnDate IS NULL",
+            new { readerCardNo },
+            transaction);
+
+        if (hasLoans > 0)
+        {
+            return Results.Conflict(new { message = "该读者尚有未归还的图书，无法删除。" });
+        }
+
+        await connection.ExecuteAsync("DELETE FROM dbo.Accounts WHERE ReaderCardNo = @readerCardNo", new { readerCardNo }, transaction);
+        var affected = await connection.ExecuteAsync("DELETE FROM dbo.Readers WHERE ReaderCardNo = @readerCardNo", new { readerCardNo }, transaction);
+
+        await transaction.CommitAsync();
+        return affected == 0 ? Results.NotFound() : Results.NoContent();
+    }
+    catch
+    {
+        await transaction.RollbackAsync();
+        throw;
+    }
+}).RequireAuthorization("AdminOnly");
+
+// 5. 获取单个读者个人详情（也就是你刚才贴在最后的那个方法）
 readers.MapGet("/{cardNo}", async (string cardNo, ClaimsPrincipal user, SqlConnectionFactory db) =>
 {
     if (!CanAccessReader(user, cardNo))
@@ -244,20 +362,86 @@ readers.MapGet("/{cardNo}", async (string cardNo, ClaimsPrincipal user, SqlConne
 
     return Results.Ok(new { reader, openLoans });
 });
-
 readers.MapPost("", async (UpsertReaderRequest request, SqlConnectionFactory db) =>
 {
     await using var connection = db.Create();
-    await connection.ExecuteAsync(
-        """
+    await connection.OpenAsync();
+
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    try
+    {
+        // 1. 插入读者信息
+        var sqlReader = """
         INSERT INTO dbo.Readers (ReaderCardNo, Name, Gender, Title, MaxBorrowCount, BorrowedCount, Department, Phone)
         VALUES (@ReaderCardNo, @Name, @Gender, @Title, @MaxBorrowCount, @BorrowedCount, @Department, @Phone)
-        """,
-        request);
+        """;
 
-    return Results.Created($"/api/readers/{request.ReaderCardNo}", request);
+        var readerExists = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(1) FROM dbo.Readers WHERE ReaderCardNo = @ReaderCardNo",
+            new { request.ReaderCardNo },
+            transaction);
+
+        if (readerExists > 0)
+        {
+            return Results.Conflict(new { message = "Reader card number already exists." });
+        }
+
+        var nextReaderUsername = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT ISNULL(MAX(TRY_CONVERT(int, Username)), 2024000)
+            FROM dbo.Accounts
+            WHERE Role = 'Reader' AND TRY_CONVERT(int, Username) IS NOT NULL
+            """,
+            transaction: transaction);
+
+        var username = (nextReaderUsername + 1).ToString();
+
+        var accountExists = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(1) FROM dbo.Accounts WHERE Username = @Username",
+            new { Username = username },
+            transaction);
+
+        if (accountExists > 0)
+        {
+            return Results.Conflict(new { message = "Generated reader account already exists. Please retry." });
+        }
+
+        await connection.ExecuteAsync(sqlReader, request, transaction: transaction);
+
+        // 2. 密码加密处理
+        var rawPassword = string.IsNullOrWhiteSpace(request.Password) ? username : request.Password.Trim();
+        var salt = "LIBRARY_SYSTEM_2026";
+        var hash = PasswordService.Hash(request.ReaderCardNo, rawPassword, salt);
+
+        // 3. 同步创建账号
+        var sqlAccount = """
+        INSERT INTO dbo.Accounts (Username, PasswordHash, PasswordSalt, Role, ReaderCardNo, IsEnabled)
+        VALUES (@Username, @hash, @salt, 'Reader', @ReaderCardNo, 1)
+        """;
+
+        await connection.ExecuteAsync(sqlAccount, new 
+        {
+            Username = username,
+            hash = hash,
+            salt = salt,
+            ReaderCardNo = request.ReaderCardNo
+        }, transaction: transaction);
+
+        await transaction.CommitAsync();
+
+        return Results.Created($"/api/readers/{request.ReaderCardNo}", new
+        {
+            request.ReaderCardNo,
+            Username = username
+        });
+    }
+    catch (Exception ex)
+    {
+        await transaction.RollbackAsync();
+        return Results.BadRequest(new { message = "创建读者及开户失败，数据已回滚", detail = ex.Message });
+    }
 }).RequireAuthorization("AdminOnly");
-
 readers.MapPut("/{cardNo}", async (string cardNo, UpsertReaderRequest request, SqlConnectionFactory db) =>
 {
     await using var connection = db.Create();
@@ -328,9 +512,28 @@ accounts.MapPost("", async (UpsertAccountRequest request, SqlConnectionFactory d
         return Results.BadRequest(new { message = "新增账号必须填写密码。" });
     }
 
+    if (!string.Equals(request.Role, "Admin", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new { message = "账号管理页面只允许新增管理员账号。" });
+    }
+
+    if (!string.IsNullOrWhiteSpace(request.ReaderCardNo))
+    {
+        return Results.BadRequest(new { message = "管理员账号不能关联读者证号。" });
+    }
+
     var salt = "LIBRARY_SYSTEM_2026";
     var hash = PasswordService.Hash(request.Username, request.Password, salt);
     await using var connection = db.Create();
+    var exists = await connection.ExecuteScalarAsync<int>(
+        "SELECT COUNT(1) FROM dbo.Accounts WHERE Username = @Username",
+        new { request.Username });
+
+    if (exists > 0)
+    {
+        return Results.Conflict(new { message = "账号已存在。" });
+    }
+
     var id = await connection.ExecuteScalarAsync<int>(
         """
         INSERT INTO dbo.Accounts (Username, PasswordHash, PasswordSalt, Role, ReaderCardNo, IsEnabled)
@@ -422,19 +625,6 @@ loans.MapGet("", async (string? q, string? status, ClaimsPrincipal user, SqlConn
 loans.MapPost("", async (UpsertBorrowRecordRequest request, SqlConnectionFactory db) =>
 {
     await using var connection = db.Create();
-
-    var overdueCount = await connection.ExecuteScalarAsync<int>(@"
-        SELECT COUNT(1) 
-        FROM dbo.BorrowRecords 
-        WHERE ReaderCardNo = @ReaderCardNo 
-          AND ReturnDate IS NULL 
-          AND DATEADD(day, LoanDays, BorrowDate) < GETDATE()", 
-        new { ReaderCardNo = request.ReaderCardNo });
-
-    if (overdueCount > 0)
-    {
-        return Results.BadRequest(new { message = "借阅失败：该读者当前有逾期未归还的图书，请先归还！" });
-    }
     
     var id = await connection.ExecuteScalarAsync<int>(
         """
@@ -493,21 +683,6 @@ loans.MapPost("/borrow", async (BorrowBookRequest request, ClaimsPrincipal user,
         }
 
         await using var connection = db.Create();
-
-        // ================== 核心漏洞修复：在这里强行拦截逾期读者 ==================
-        var overdueCount = await connection.ExecuteScalarAsync<int>(@"
-            SELECT COUNT(1) 
-            FROM dbo.BorrowRecords 
-            WHERE ReaderCardNo = @ReaderCardNo 
-              AND ReturnDate IS NULL 
-              AND DATEADD(day, LoanDays, BorrowDate) < GETDATE()", 
-            new { ReaderCardNo = readerCardNo });
-
-        if (overdueCount > 0)
-        {
-            return Results.BadRequest(new { message = "借阅失败：您当前有逾期未归还的图书，请先归还！" });
-        }
-        // ====================================================================
 
         var loanIdDecimal = await connection.ExecuteScalarAsync<decimal>(
             "dbo.sp_BorrowBook",
@@ -727,7 +902,7 @@ public sealed record UpsertAccountRequest(string Username, string? Password, str
 public sealed record BookDto(string Isbn, string Title, string Publisher, string Author, int TotalCopies, int AvailableCopies, bool IsBorrowable);
 public sealed record UpsertBookRequest(string Isbn, string Title, string Publisher, string Author, int TotalCopies, int AvailableCopies, bool IsBorrowable);
 public sealed record ReaderDto(string ReaderCardNo, string Name, string Gender, string Title, int MaxBorrowCount, int BorrowedCount, string Department, string? Phone, decimal UnpaidFine);
-public sealed record UpsertReaderRequest(string ReaderCardNo, string Name, string Gender, string Title, int MaxBorrowCount, int BorrowedCount, string Department, string? Phone);
+public sealed record UpsertReaderRequest(string ReaderCardNo, string Name, string Gender, string Title, int MaxBorrowCount, int BorrowedCount, string Department, string? Phone, string? Password);
 public sealed record BorrowRecordDto(int LoanId, string ReaderCardNo, string ReaderName, string Isbn, string BookTitle, DateTime BorrowDate, int LoanDays, DateTime DueDate, DateTime? ReturnDate, decimal Fine, bool FinePaid, string? Remark, string Status);
 public sealed record UpsertBorrowRecordRequest(string ReaderCardNo, string Isbn, DateTime BorrowDate, int LoanDays, DateTime? ReturnDate, decimal Fine, bool FinePaid, string? Remark);
 public sealed record BorrowBookRequest(string ReaderCardNo, string Isbn, DateTime? BorrowDate, int LoanDays);

@@ -1,0 +1,34 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: library_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Library@2026"
+      MSSQL_PID: "Developer"
+    ports:
+      - "14333:1433"
+    volumes:
+      - library_sql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/1433'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  db-init:
+    image: mcr.microsoft.com/mssql-tools
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      SA_PASSWORD: "Library@2026"
+    volumes:
+      - ../database:/scripts:ro
+    command: >
+      bash -c "/opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P \"$${SA_PASSWORD}\" -C -i /scripts/01_schema.sql
+      && /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P \"$${SA_PASSWORD}\" -C -i /scripts/02_seed.sql"
+    restart: "no"
+
+volumes:
+  library_sql_data:

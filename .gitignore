@@ -1,0 +1,15 @@
+bin/
+obj/
+node_modules/
+dist/
+wwwroot/
+.vs/
+.vscode/
+*.user
+*.suo
+*.db
+*.log
+publish/
+deploy/out/
+desktop/WebRuntime/
+server/appsettings.Local.json
